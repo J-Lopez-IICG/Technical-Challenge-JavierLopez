@@ -1,17 +1,14 @@
 """
-Main ETL Pipeline for Transaction Processing - Phase 1 (MinIO Integrated)
+Main ETL Pipeline for Transaction Processing - Phase 2 (ETL & Fraud Detection)
 
 This script runs continuously, generating fake transactions every minute,
 uploading them to a MinIO Data Lake, and processing them through a pipeline.
-
-TODO: Complete the following functions:
-1. clean_data() - Clean and validate the raw transaction data
-2. detect_suspicious_transactions() - Identify potentially fraudulent transactions
 """
 
 import time
 import pandas as pd
 import boto3
+import requests
 from datetime import datetime
 from pathlib import Path
 from botocore.exceptions import ClientError
@@ -40,7 +37,7 @@ def setup_folders():
     TRANSACTIONS_FOLDER.mkdir(exist_ok=True)
     PROCESSED_FOLDER.mkdir(exist_ok=True)
     SUSPICIOUS_FOLDER.mkdir(exist_ok=True)
-    print(f"Folders initialized:")
+    print("Folders initialized:")
     print(f"  - Data Lake (Staging): {TRANSACTIONS_FOLDER}")
     print(f"  - Processed: {PROCESSED_FOLDER}")
     print(f"  - Suspicious: {SUSPICIOUS_FOLDER}")
@@ -81,7 +78,7 @@ def generate_batch():
         # Cleanup: Remove local redundancy after successful upload
         if filename.exists():
             filename.unlink()
-            print(f"Staging cleaned: Local file removed.")
+            print("Staging cleaned: Local file removed.")
 
     except Exception as e:
         print(f"Data Lake Error: Sync failed, local file preserved: {e}")
@@ -91,126 +88,184 @@ def generate_batch():
 
 def clean_data(df):
     """
-    TODO: Implement data cleaning logic
-
-    Clean and validate the transaction data. Consider:
-    - Handling missing values
-    - Removing duplicates
-    - Data type validation
-    - Standardizing formats
-    - Handling outliers
-
-    Args:
-        df (pd.DataFrame): Raw transaction data
-
-    Returns:
-        pd.DataFrame: Cleaned transaction data
+    Limpieza técnica basada en el análisis del generador.
     """
-    # For now, return the original DF to maintain flow
-    # df_clean = df.copy()
+    df_clean = df.copy()
+
+    # 1. Manejo de Nulos (Imputación lógica)
+    currency_by_country = {"MX": "MXN", "BR": "BRL", "CO": "COP", "AR": "ARS", "CL": "CLP", "PE": "PEN"}
+    df_clean['currency'] = df_clean['currency'].fillna(df_clean['country'].map(currency_by_country))
+    df_clean['currency'] = df_clean['currency'].fillna('USD') # Fallback final
+
+    # IP Address nula -> placeholder
+    df_clean['ip_address'] = df_clean['ip_address'].fillna('0.0.0.0')
+
+    # 2. Validación de Tipos
+    df_clean['timestamp'] = pd.to_datetime(df_clean['timestamp'])
+    df_clean['settlement_date'] = pd.to_datetime(df_clean['settlement_date'])
+    df_clean['amount'] = pd.to_numeric(df_clean['amount'], errors='coerce')
+
+    # 3. Estandarización
+    df_clean['country'] = df_clean['country'].astype(str).str.upper().str.strip()
+
+    # 4. Manejo de Outliers Técnicos
+    df_clean = df_clean[(df_clean['amount'] > 0) & (df_clean['amount'] < 1000000)]
+
+    return df_clean
+
+
+def convert_to_usd(df):
+    """
+    Normalización de montos usando API de tipos de cambio con Timeout agresivo.
+    """
+    print("  -> Fetching exchange rates...")
+    try:
+        response = requests.get("https://open.er-api.com/v6/latest/USD", timeout=2)
+        rates = response.json().get('rates', {})
+
+        df['rate_to_usd'] = df['currency'].map(lambda x: rates.get(x, 1.0))
+        df['amount_usd'] = round(df['amount'] / df['rate_to_usd'], 2)
+        print("  -> API conversion successful.")
+
+    except Exception as e:
+        print("  -> API notice: Using static rates (fallback).")
+        static_rates = {"MXN": 17.0, "BRL": 5.0, "COP": 3900.0, "ARS": 800.0, "CLP": 950.0, "PEN": 3.7, "USD": 1.0}
+        df['amount_usd'] = df.apply(lambda x: round(x['amount'] / static_rates.get(x['currency'], 1.0), 2), axis=1)
+
     return df
 
 
 def detect_suspicious_transactions(df):
     """
-    TODO: Implement fraud detection logic
-
-    Identify suspicious transactions based on various criteria. Consider:
-    - Unusually high amounts
-    - Multiple failed attempts
-    - High-risk countries or merchants
-
-    Args:
-        df (pd.DataFrame): Cleaned transaction data
-
-    Returns:
-        tuple: (normal_df, suspicious_df) - DataFrames split by suspicion status
+    Detección de fraude basada en reglas de negocio.
     """
-    # For now, return empty suspicious DF to maintain flow
-    return df, pd.DataFrame()
+    df_analysis = df.copy()
+
+    # CRITERIO 1: Montos altos en USD
+    mask_high_amount = df_analysis['amount_usd'] > 10000
+
+    # CRITERIO 2: Múltiples intentos fallidos
+    mask_reentry = (df_analysis['status'] == 'declined') & (df_analysis['attempt_number'] >= 3)
+
+    # CRITERIO 3: Violaciones de Seguridad
+    mask_security = df_analysis['response_message'].str.contains('Security violation', case=False, na=False)
+
+    # CRITERIO 4: Transacciones internacionales de alto monto (> $500 USD)
+    mask_intl_risk = (df_analysis['is_international'] == True) & (df_analysis['amount_usd'] > 500)
+
+    # Combinar reglas
+    is_suspicious = mask_high_amount | mask_reentry | mask_security | mask_intl_risk
+
+    df_suspicious = df_analysis[is_suspicious].copy()
+    df_normal = df_analysis[~is_suspicious].copy()
+
+    return df_normal, df_suspicious
 
 
 def process_batch(df_raw):
     """
-    Process a batch of transactions through the ETL pipeline
-
-    Args:
-        df_raw (pd.DataFrame): Raw transaction data in memory
+    Process a batch of transactions through the ETL pipeline including
+    currency normalization via API and cloud persistence.
     """
     try:
-        print(f"Loaded {len(df_raw)} transactions")
+        print(f"Loaded {len(df_raw)} transactions from Data Lake")
 
         # Step 1: Clean the data
-        print("Cleaning data...")
+        print("Cleaning and standardizing data...")
         df_clean = clean_data(df_raw)
-        print(f"Cleaned {len(df_clean)} transactions")
 
-        # Step 2: Detect suspicious transactions
+        # Step 2: Currency Conversion (Bonus Point)
+        print("Normalizing currencies via ExchangeRate API...")
+        df_normalized = convert_to_usd(df_clean)
+        print(f"Standardized {len(df_normalized)} transactions to USD")
+
+        # Step 3: Detect suspicious transactions
         print("Detecting suspicious transactions...")
-        df_normal, df_suspicious = detect_suspicious_transactions(df_clean)
-        print(f"Found {len(df_suspicious)} suspicious transactions")
-        print(f"Found {len(df_normal)} normal transactions")
+        df_normal, df_suspicious = detect_suspicious_transactions(df_normalized)
 
-        # Save processed results
+        print("Analysis Results:")
+        print(f"  - Suspicious: {len(df_suspicious)}")
+        print(f"  - Normal: {len(df_normal)}")
+
+        # Step 4: Save processed results locally AND to MinIO
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if len(df_normal) > 0:
-            normal_file = PROCESSED_FOLDER / f"processed_{timestamp}.csv"
-            df_normal.to_csv(normal_file, index=False)
-            print(f"Saved normal transactions to: {normal_file}")
+            filename = f"processed_{timestamp}.csv"
+            local_path = PROCESSED_FOLDER / filename
+            df_normal.to_csv(local_path, index=False)
+
+            # Subida a MinIO
+            s3_client.upload_file(str(local_path), BUCKET_NAME, f"silver/processed/{filename}")
+            print(f"Saved & Uploaded to Data Lake: silver/processed/{filename}")
+
+            # Limpieza local
+            if local_path.exists():
+                local_path.unlink()
+                print("Local processed file cleaned.")
 
         if len(df_suspicious) > 0:
-            suspicious_file = SUSPICIOUS_FOLDER / f"suspicious_{timestamp}.csv"
-            df_suspicious.to_csv(suspicious_file, index=False)
-            print(f"WARNING: Saved suspicious transactions to: {suspicious_file}")
+            filename = f"suspicious_{timestamp}.csv"
+            local_path = SUSPICIOUS_FOLDER / filename
+            df_suspicious.to_csv(local_path, index=False)
 
-        print(f"Batch processing completed successfully")
+            # Subida a MinIO
+            s3_client.upload_file(str(local_path), BUCKET_NAME, f"silver/suspicious/{filename}")
+            print(f"WARNING: Saved & Uploaded suspicious: silver/suspicious/{filename}")
 
-    except NotImplementedError as e:
-        print(f"WARNING: Skipping processing: {e}")
+            # Limpieza local
+            if local_path.exists():
+                local_path.unlink()
+                print("Local suspicious file cleaned.")
+
+        print("Batch processing completed successfully")
+
     except Exception as e:
         print(f"ERROR: Error processing batch: {e}")
 
 
 def main():
-    """Main loop - generates and processes transactions every minute"""
+    """Main loop - orchestrates generation, sync to MinIO, and ETL processing"""
     print("="*60)
-    print("Transaction Processing Pipeline (MinIO Storage)")
+    print("FINTECH DATA PIPELINE - PHASE 2: ETL & FRAUD DETECTION")
     print("="*60)
 
     setup_folders()
 
     try:
         setup_minio()
-    except Exception:
-        print("Failed to initialize MinIO. Exiting...")
+    except Exception as e:
+        print(f"CRITICAL ERROR: Could not connect to MinIO/S3. {e}")
         return
 
-    print(f"\nStarting continuous processing (every {INTERVAL_SECONDS} seconds)")
-    print("Press Ctrl+C to stop\n")
+    print("\nPipeline status: ACTIVE")
+    print(f"Interval: {INTERVAL_SECONDS}s | Batch Size: {TRANSACTIONS_PER_BATCH}")
+    print("Press Ctrl+C to stop safely\n")
 
     batch_count = 0
 
     try:
         while True:
             batch_count += 1
-            print(f"\n{'='*60}")
-            print(f"BATCH #{batch_count}")
-            print(f"{'='*60}")
+            print(f"\n{'#'*60}")
+            print(f"PROCESSING BATCH #{batch_count}")
+            print(f"{'#'*60}")
 
-            # Generate new transactions and sync with S3
             df_to_process = generate_batch()
 
-            # Process the batch directly in memory
-            process_batch(df_to_process)
+            if df_to_process is not None and not df_to_process.empty:
+                process_batch(df_to_process)
+            else:
+                print("Skipping batch: No data received.")
 
-            # Wait for next interval
-            print(f"\nWaiting {INTERVAL_SECONDS} seconds until next batch...")
+            print(f"\nWaiting {INTERVAL_SECONDS} seconds for next sync...")
             time.sleep(INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
-        print("\n\nPipeline stopped by user")
+        print("\n\n" + "!"*30)
+        print("Pipeline manually stopped by user")
         print(f"Total batches processed: {batch_count}")
+        print("!"*30)
 
 
 if __name__ == "__main__":
