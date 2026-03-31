@@ -1,3 +1,4 @@
 pandas
 numpy
 faker
+boto3
