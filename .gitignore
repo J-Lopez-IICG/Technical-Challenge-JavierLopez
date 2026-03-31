@@ -1,0 +1,12 @@
+# Entorno virtual
+venv/
+.env
+
+# Datos y resultados
+transactions/*.csv
+processed/*.csv
+suspicious/*.csv
+
+# Python
+__pycache__/
+*.py[cod]
