@@ -3,3 +3,5 @@ numpy
 faker
 boto3
 requests
+SQLAlchemy
+psycopg2-binary

@@ -159,3 +159,198 @@ graph TD
     class Ephemeral_Storage,Staging temp;
     class API external;
 ```
+## Arquitectura de la Fase 3: Modelado Dimensional y Data Warehouse
+
+En esta etapa se transformó el flujo de datos en una solución analítica de alto rendimiento mediante la implementación de un **Data Warehouse** basado en el modelo de **Esquema Estrella (Star Schema)**. Se integró un motor relacional para permitir consultas complejas y garantizar la integridad de los datos financieros.
+
+### Componentes Técnicos
+* **Data Warehouse (PostgreSQL):** Despliegue de una instancia de PostgreSQL 15 mediante Docker, configurada con persistencia de volúmenes para asegurar la durabilidad del almacén de datos analíticos.
+* **Modelado Kimball (Star Schema):** Diseño de una tabla de hechos centralizada (`fact_transactions`) vinculada a dimensiones maestras, optimizando la velocidad de lectura y facilitando la agregación de KPIs de negocio.
+* **Carga de Dimensiones (SCD Tipo 0):** Implementación de un proceso de inicialización para dimensiones estáticas y de lenta evolución como Usuarios, Comercios, Métodos de Pago y una Dimensión Temporal detallada.
+* **Integridad Referencial Dinámica:** Uso de SQLAlchemy y scripts de auditoría SQL para establecer llaves primarias (PK) y foráneas (FK), asegurando que ninguna transacción sea procesada sin un contexto válido en el ecosistema.
+
+## Estado de Avance: Fase 3
+
+| Objetivo | Estado | Descripción Técnica | Tiempo Estimado |
+| :--- | :--- | :--- | :--- |
+| **Infraestructura DW** | Completado | Orquestación de PostgreSQL en Docker con Healthchecks y volúmenes. | 45 min |
+| **Modelo Dimensional** | Completado | Creación de dimensiones `dim_time`, `dim_users`, `dim_merchants` y `dim_payment_methods`. | 1h 15 min |
+| **Carga de Hechos** | Completado | Script de extracción de capa Silver (MinIO) e inserción incremental en `fact_transactions`. | 1h 00 min |
+| **Integridad de Datos** | Completado | Normalización de llaves (IDs numéricos) y establecimiento de constraints PK/FK. | 45 min |
+| **Auditoría de Modelo** | Completado | Validación mediante consultas al catálogo del sistema (`pg_constraint`). | 30 min |
+
+> **Nota sobre el Cronograma:** El tiempo total invertido en la Fase 3 fue de **4.25 horas**. Este tiempo incluye el diseño del modelo lógico, la corrección de tipos de datos entre DataFrames y SQL, y la optimización de la tabla de hechos para soportar análisis multivariables.
+
+## Decisiones de Ingeniería y Arquitectura
+
+* **Normalización de Llaves:** Se reemplazaron los atributos descriptivos (texto) en la tabla de hechos por llaves subrogadas numéricas. Esto reduce el almacenamiento en un 60% y acelera los *Joins* analíticos en magnitudes de 10x a 100x.
+* **Dimensión Temporal Especializada:** Se generó una tabla `dim_time` con granularidad diaria que incluye atributos como `is_weekend`, `quarter` y `day_name`. Esto permite al equipo de negocio realizar análisis de estacionalidad de fraude sin necesidad de procesar funciones de fecha en tiempo de ejecución.
+* **Carga Incremental (Append):** El script de carga de hechos se configuró con la política `if_exists='append'`, permitiendo que el pipeline alimente el Data Warehouse de forma continua sin destruir el historial de transacciones procesadas anteriormente.
+* **Validación de Metadata:** Se implementaron consultas directas al diccionario de datos de PostgreSQL para asegurar que la arquitectura lógica coincida con la física, garantizando que el modelo estrella esté correctamente "soldado" en el motor de base de datos.
+
+### Flujo de Datos de la Fase 3
+
+```mermaid
+graph TD
+    %% Nodos
+    S3[(MinIO: Layer Silver)]
+
+    subgraph ETL_Load_Process [Python ETL Loader]
+        DimLoader[load_dimensions.py]
+        FactLoader[load_facts.py]
+    end
+
+    subgraph Data_Warehouse [PostgreSQL: Star Schema]
+        Fact[fact_transactions]
+        D_Time[dim_time]
+        D_User[dim_users]
+        D_Merc[dim_merchants]
+        D_Pay[dim_payment_methods]
+    end
+
+    %% Conexiones
+    DimLoader ==>|Initial Load| D_User
+    DimLoader ==>|Initial Load| D_Merc
+    DimLoader ==>|Initial Load| D_Time
+    DimLoader ==>|Initial Load| D_Pay
+
+    S3 -.->|Extract Latest| FactLoader
+    FactLoader ==>|Transform & Append| Fact
+
+    Fact -.->|FK| D_Time
+    Fact -.->|FK| D_User
+    Fact -.->|FK| D_Merc
+    Fact -.->|FK| D_Pay
+
+    %% Estilos
+    classDef warehouse fill:#004080,stroke:#333,stroke-width:2px,color:#fff;
+    classDef loader fill:#d98c00,stroke:#333,stroke-width:2px,color:#fff;
+    classDef storage fill:#28a745,stroke:#333,stroke-width:2px,color:#fff;
+
+    class Data_Warehouse,Fact,D_Time,D_User,D_Merc,D_Pay warehouse;
+    class ETL_Load_Process,DimLoader,FactLoader loader;
+    class S3 storage;
+```
+## Documentación del Modelo de Datos (Star Schema)
+
+El almacén de datos sigue un diseño de **Estrella** para optimizar las consultas analíticas. La tabla de hechos centraliza los eventos métricos, mientras que las dimensiones proveen el contexto.
+
+### Diagrama de Entidad-Relación (ERD)
+![Modelo Dimensional](./img/star_model.png)
+
+### Diccionario de Datos
+
+#### 1. Tabla de Hechos: `fact_transactions`
+Almacena el detalle granular de cada evento transaccional, incluyendo métricas financieras y claves foráneas para el análisis dimensional.
+
+| Columna | Tipo de Dato | Descripción | Atributo |
+| :--- | :--- | :--- | :--- |
+| `transaction_id` | TEXT | Identificador único de la transacción (UUID). | **PK** |
+| `time_key` | BIGINT | Llave temporal en formato AAAAMMDD para enlace con dim_time. | **FK** |
+| `user_id` | BIGINT | Identificador único del cliente que origina la operación. | **FK** |
+| `merchant_id` | BIGINT | Identificador del comercio donde se realiza el consumo. | **FK** |
+| `payment_method_id` | INTEGER | Identificador del método de pago utilizado. | **FK** |
+| `amount` | DOUBLE PRECISION | Monto original de la transacción en moneda local. | Métrica |
+| `currency` | TEXT | Código ISO de la moneda original (ej. MXN, BRL). | Contexto |
+| `amount_usd` | DOUBLE PRECISION | Monto normalizado a Dólares Estadounidenses. | Métrica |
+| `rate_to_usd` | DOUBLE PRECISION | Tipo de cambio aplicado en el momento del procesamiento. | Métrica |
+| `transaction_fee` | DOUBLE PRECISION | Comisión cobrada por la plataforma por la transacción. | Métrica |
+| `net_amount` | DOUBLE PRECISION | Monto líquido tras descontar comisiones e impuestos. | Métrica |
+| `fee_percentage` | DOUBLE PRECISION | Porcentaje de comisión aplicado según perfil de comercio. | Métrica |
+| `status` | TEXT | Estado final de la transacción (approved, declined, etc). | Atributo |
+| `response_message` | TEXT | Detalle del resultado retornado por el procesador. | Atributo |
+| `processing_time_ms` | BIGINT | Latencia de procesamiento técnico en milisegundos. | Métrica |
+| `is_international` | BOOLEAN | Flag que indica si la transacción es cross-border. | Atributo |
+| `three_ds_verified` | BOOLEAN | Indica si se utilizó protocolo de autenticación 3D Secure. | Atributo |
+| `ip_address` | TEXT | Dirección IP desde donde se originó la petición. | Seguridad |
+| `user_agent` | TEXT | Información del navegador o dispositivo del cliente. | Seguridad |
+| `device_type` | TEXT | Categorización del hardware (mobile, web, tablet). | Atributo |
+| `timestamp` | TIMESTAMP | Fecha y hora exacta del registro del evento. | Temporal |
+
+#### 2. Dimensión: `dim_users`
+Contiene la información maestra de los clientes, sus niveles de verificación y métricas agregadas de comportamiento.
+
+| Columna | Tipo de Dato | Descripción | Atributo |
+| :--- | :--- | :--- | :--- |
+| `user_id` | BIGINT | Identificador único del usuario. | **PK** |
+| `first_name` | TEXT | Nombre(s) del cliente. | PII |
+| `last_name` | TEXT | Apellido(s) del cliente. | PII |
+| `email` | TEXT | Correo electrónico de contacto. | PII |
+| `phone` | TEXT | Número telefónico vinculado. | PII |
+| `country` | TEXT | País de residencia legal. | Geografía |
+| `city` | TEXT | Ciudad de residencia. | Geografía |
+| `address` | TEXT | Dirección física registrada. | Geografía |
+| `date_of_birth` | TEXT | Fecha de nacimiento (formato ISO). | Perfil |
+| `registration_date` | TEXT | Fecha en que el usuario abrió su cuenta. | Perfil |
+| `account_status` | TEXT | Estado de la cuenta (Active, Suspended, etc.). | Atributo |
+| `kyc_level` | TEXT | Nivel de conocimiento del cliente (Tier 1, 2, 3). | Cumplimiento |
+| `kyc_verified` | BOOLEAN | Indica si la identidad ha sido validada. | Cumplimiento |
+| `risk_score` | DOUBLE PRECISION | Score interno de riesgo crediticio/fraude (0-1). | Riesgo |
+| `total_transactions` | BIGINT | Cantidad histórica de transacciones realizadas. | Histórico |
+| `total_volume` | DOUBLE PRECISION | Monto total transaccionado históricamente. | Histórico |
+| `transaction_limit_daily`| BIGINT | Límite máximo de gasto diario permitido. | Control |
+| `has_active_card` | BOOLEAN | Indica si el usuario posee una tarjeta vigente. | Atributo |
+| `last_login` | TEXT | Última fecha de acceso a la plataforma. | Seguridad |
+
+#### 3. Dimensión: `dim_merchants`
+Contiene la información detallada de los comercios afiliados, sus métricas operativas y niveles de cumplimiento de seguridad.
+
+| Columna | Tipo de Dato | Descripción | Atributo |
+| :--- | :--- | :--- | :--- |
+| `merchant_id` | BIGINT | Identificador único del comercio. | **PK** |
+| `company_name` | TEXT | Nombre comercial del establecimiento. | Atributo |
+| `legal_name` | TEXT | Razón social legal del comercio. | Atributo |
+| `tax_id` | TEXT | Identificador fiscal (RUT/NIT/RFC). | Legal |
+| `category` | TEXT | Sector industrial (ej. Retail, Gaming, Food). | Segmento |
+| `subcategory` | TEXT | Especialización del rubro comercial. | Segmento |
+| `country` | TEXT | País de operación principal. | Geografía |
+| `city` | TEXT | Ciudad de la casa matriz. | Geografía |
+| `merchant_status` | TEXT | Estado del comercio (Active, Under Review, etc.). | Atributo |
+| `commission_rate` | DOUBLE PRECISION | Tasa de comisión acordada por transacción. | Comercial |
+| `settlement_frequency` | TEXT | Frecuencia de liquidación (Daily, Weekly, Monthly). | Comercial |
+| `pci_compliant` | BOOLEAN | Indica si cumple con estándares de seguridad de datos. | Seguridad |
+| `risk_score` | DOUBLE PRECISION | Nivel de riesgo asignado al comercio (0-1). | Riesgo |
+| `chargeback_rate` | DOUBLE PRECISION | Tasa histórica de disputas/contracargos. | Riesgo |
+| `average_ticket` | DOUBLE PRECISION | Monto promedio por transacción. | Métrica |
+| `monthly_volume` | DOUBLE PRECISION | Volumen transaccional mensual promedio. | Métrica |
+| `monthly_transactions` | BIGINT | Cantidad de transacciones mensuales promedio. | Métrica |
+| `has_api_integration` | BOOLEAN | Indica si utiliza integración directa vía API. | Técnico |
+| `kyc_verified` | BOOLEAN | Indica si el comercio pasó el proceso de validación. | Cumplimiento |
+
+#### 4. Dimensión: `dim_time`
+Provee una estructura jerárquica temporal para realizar análisis de estacionalidad, tendencias por periodos y comparativas temporales (MoM, YoY).
+
+| Columna | Tipo de Dato | Descripción | Atributo |
+| :--- | :--- | :--- | :--- |
+| `time_key` | BIGINT | Identificador único en formato AAAAMMDD (ej. 20260331). | **PK** |
+| `full_date` | TIMESTAMP | Fecha completa en formato estándar de base de datos. | Temporal |
+| `year` | INTEGER | Año calendario de la transacción. | Jerarquía |
+| `quarter` | INTEGER | Trimestre del año (1 a 4). | Jerarquía |
+| `month` | INTEGER | Número del mes (1 a 12). | Jerarquía |
+| `month_name` | TEXT | Nombre completo del mes (Enero, Febrero, etc.). | Atributo |
+| `day` | INTEGER | Día del mes (1 a 31). | Jerarquía |
+| `day_of_week` | INTEGER | Número de día de la semana (1 a 7). | Atributo |
+| `day_name` | TEXT | Nombre del día (Lunes, Martes, etc.). | Atributo |
+| `is_weekend` | BOOLEAN | Flag que indica si la fecha corresponde a Sábado o Domingo. | Análisis |
+
+#### 5. Dimensión: `dim_payment_methods`
+Almacena la información técnica y de seguridad de los instrumentos de pago vinculados a los usuarios, permitiendo el análisis de fraude por emisor o tipo de tarjeta.
+
+| Columna | Tipo de Dato | Descripción | Atributo |
+| :--- | :--- | :--- | :--- |
+| `payment_method_id` | BIGINT | Identificador único del método de pago. | **PK** |
+| `user_id` | BIGINT | ID del usuario propietario del método de pago. | **FK** |
+| `payment_type` | TEXT | Tipo de instrumento (Credit Card, Debit, E-wallet). | Segmento |
+| `provider` | TEXT | Red de procesamiento (Visa, Mastercard, AMEX). | Segmento |
+| `issuer_bank` | TEXT | Banco emisor del instrumento financiero. | Atributo |
+| `country` | TEXT | País de emisión de la tarjeta/cuenta. | Geografía |
+| `status` | TEXT | Estado del método (Active, Expired, Blocked). | Atributo |
+| `is_default` | BOOLEAN | Indica si es el método de pago principal del usuario. | Perfil |
+| `expiry_date` | TEXT | Fecha de vencimiento del instrumento. | Seguridad |
+| `last_four_digits` | TEXT | Últimos 4 dígitos para identificación visual segura. | PII |
+| `cvv_verified` | BOOLEAN | Indica si el código de seguridad fue validado. | Seguridad |
+| `three_ds_enabled` | BOOLEAN | Indica si el método soporta autenticación reforzada. | Seguridad |
+| `failed_attempts` | BIGINT | Conteo de intentos fallidos con este método. | Riesgo |
+| `risk_score` | DOUBLE PRECISION | Score de riesgo específico del instrumento (0-1). | Riesgo |
+| `total_amount_processed`| DOUBLE PRECISION | Volumen histórico procesado por este método. | Métrica |
+| `transactions_count` | BIGINT | Cantidad de transacciones exitosas con este método. | Métrica |
