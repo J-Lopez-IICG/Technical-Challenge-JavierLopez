@@ -426,3 +426,96 @@ Almacena la información técnica y de seguridad de los instrumentos de pago vin
 | `risk_score` | DOUBLE PRECISION | Score de riesgo específico del instrumento (0-1). | Riesgo |
 | `total_amount_processed`| DOUBLE PRECISION | Volumen histórico procesado por este método. | Métrica |
 | `transactions_count` | BIGINT | Cantidad de transacciones exitosas con este método. | Métrica |
+
+## Arquitectura de la Fase 4: Procesamiento en Tiempo Real (Streaming)
+
+En esta etapa se implementó un sistema de arquitectura orientada a eventos (Event-Driven) para detectar y analizar transacciones sospechosas con latencia mínima, complementando el procesamiento por lotes (*batch*) con un motor de mensajería en tiempo real (*streaming*).
+
+### Componentes Técnicos
+* **Message Broker (Apache Kafka):** Despliegue de un clúster ligero (Kafka + Zookeeper v7.4.0) mediante Docker para gestionar el flujo de alertas de fraude de forma asíncrona y desacoplada del pipeline ETL principal.
+* **Productor Embebido (Producer):** Modificación del script principal de procesamiento para que, en el milisegundo en que se detecta una anomalía, el registro se serialice en JSON y se dispare al tópico `fraud_alerts` de Kafka, sin interrumpir la persistencia en el Data Lake.
+* **Consumidor Analítico (Consumer):** Desarrollo de un servicio independiente en Python (`real_time_monitor.py`) que escucha continuamente el tópico, procesa el flujo de datos y aplica una lógica de ventanas de tiempo (*Time-Windowing*) para generar agregaciones en memoria.
+
+### Iniciar Monitor en Tiempo Real
+Asegurando que la infraestructura Docker esté activa, ejecutar en una terminal independiente:
+
+```bash
+python real_time_monitor.py
+```
+## Estado de Avance: Fase 4
+
+| Objetivo | Estado | Descripción Técnica | Tiempo Estimado |
+| :--- | :--- | :--- | :--- |
+| **Infraestructura Kafka** | Completado | Configuración de Zookeeper y Kafka con listeners duales (Interno/Externo) en Docker. | 45 min |
+| **Kafka Producer** | Completado | Inyección de cliente `kafka-python` en el pipeline ETL para publicación asíncrona. | 30 min |
+| **Kafka Consumer** | Completado | Desarrollo de servicio independiente de escucha continua para el tópico `fraud_alerts`. | 45 min |
+| **Time-Windowing** | Completado | Implementación de cálculo de estadísticas agregadas por ventanas de un minuto en memoria. | 30 min |
+
+> **Nota sobre el Cronograma:** El tiempo total invertido en la Fase 4 fue de **2.5 horas**. Este tiempo contempla la resolución de conflictos de red en los puertos de Docker (configuración de listeners), el ajuste de versión de la imagen de Kafka para evitar inestabilidades con KRaft, y la lógica de agregación temporal en el script consumidor.
+
+## Decisiones de Ingeniería y Arquitectura
+
+* **Arquitectura Desacoplada:** Al integrar Kafka, el sistema ETL principal asume el rol exclusivo de productor en la mensajería. Esto garantiza que el flujo de procesamiento primario (ingesta hacia MinIO y almacenamiento en PostgreSQL) no sufra cuellos de botella ni latencia inducida por el sistema de alertas.
+* **Tolerancia a Fallos (Fail-safe):** La lógica de publicación hacia el broker de Kafka se aisló mediante bloques de control de excepciones. En caso de una caída de red o falla del contenedor de mensajería, el pipeline emite una advertencia pero continúa su ejecución iterativa con normalidad.
+* **Agregación por Ventanas de Tiempo:** En lugar de emitir únicamente alertas aisladas, el consumidor mantiene el estado en memoria para acumular las métricas en ventanas discretas (1 minuto). Esto permite observar la intensidad volumétrica y el impacto monetario (USD) de un ataque de fraude en curso.
+* **Gestión de Versiones y Estabilidad:** Se optó por fijar explícitamente las versiones de las imágenes de Confluent (7.4.0) en lugar de utilizar la etiqueta `latest`. Esto previno errores de compatibilidad y configuraciones fallidas asociadas a la transición arquitectónica hacia el protocolo KRaft en despliegues locales.
+
+### Flujo de Datos de la Fase 4
+
+```mermaid
+graph LR
+    %% Nodos
+    subgraph Airflow_Worker [ETL Pipeline Node]
+        Main[process_batch function]
+        Producer[Kafka Producer]
+    end
+
+    subgraph Streaming_Platform [Docker: Kafka Cluster]
+        Topic[Topic: fraud_alerts]
+    end
+
+    subgraph Security_Operations [Local Host]
+        Consumer[real_time_monitor.py]
+        Console[Terminal Dashboard]
+    end
+
+    %% Conexiones
+    Main ==>|1. Detecta anomalia| Producer
+    Producer ==>|2. Publica JSON Push| Topic
+    Topic -.->|3. Escucha continua Poll| Consumer
+    Consumer ==>|4. Agrega y Muestra| Console
+
+    %% Estilos
+    classDef etl fill:#d98c00,stroke:#333,stroke-width:2px,color:#fff;
+    classDef kafka fill:#000000,stroke:#333,stroke-width:2px,color:#fff;
+    classDef monitor fill:#28a745,stroke:#333,stroke-width:2px,color:#fff;
+
+    class Airflow_Worker,Main,Producer etl;
+    class Streaming_Platform,Topic kafka;
+    class Security_Operations,Consumer,Console monitor;
+```
+## Demostración de Funcionalidad en Tiempo Real
+
+A continuación se muestra la salida de consola (logs) generada por el script consumidor real_time_monitor.py durante la ejecución del pipeline. Se evidencia la recepción instantánea de transacciones anómalas y el resumen de métricas calculado por ventana de tiempo:
+
+```log
+INFO: Initializing Real-Time Fraud Monitor...
+INFO: Connecting to Kafka broker at localhost:9092...
+INFO: Connection established. Listening for incoming alerts...
+-----------------------------------------------------------------
+
+--- AGGREGATE SUMMARY FOR WINDOW: 2026-04-01 16:03 ---
+Total Suspicious Transactions: 9
+Total Suspicious Amount (USD): $54.50
+-----------------------------------------------------------------
+
+ALERT: TxID: TXN00000004 | Amount: $0.30 USD | Reason: Security violation
+ALERT: TxID: TXN00000013 | Amount: $4.85 USD | Reason: Insufficient funds
+ALERT: TxID: TXN00000033 | Amount: $8.08 USD | Reason: Security violation
+ALERT: TxID: TXN00000062 | Amount: $4.94 USD | Reason: Insufficient funds
+ALERT: TxID: TXN00000071 | Amount: $9.27 USD | Reason: Security violation
+ALERT: TxID: TXN00000077 | Amount: $3.47 USD | Reason: Exceeds withdrawal limit
+ALERT: TxID: TXN00000084 | Amount: $0.00 USD | Reason: Expired card
+ALERT: TxID: TXN00000094 | Amount: $23.26 USD | Reason: Security violation
+ALERT: TxID: TXN00000099 | Amount: $0.33 USD | Reason: Invalid card
+```
