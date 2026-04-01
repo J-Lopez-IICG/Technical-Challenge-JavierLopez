@@ -11,10 +11,12 @@ import boto3
 import requests
 import os
 import tempfile
+import json
 from datetime import datetime
 from pathlib import Path
 from botocore.exceptions import ClientError
 from scripts.generate_transactions import generate_transactions
+from kafka import KafkaProducer
 
 
 # Configuration
@@ -64,6 +66,42 @@ def setup_minio():
             print(f"S3 Connection Error: {e}")
             raise
 
+def send_suspicious_to_kafka(df_suspicious):
+    """
+    Transmits suspicious transaction records to an Apache Kafka topic for real-time processing.
+
+    Args:
+        df_suspicious (pd.DataFrame): DataFrame containing the filtered suspicious transactions.
+    """
+    if df_suspicious.empty:
+        return
+
+    try:
+        # Initialize Kafka Producer using the internal Docker network port
+        producer = KafkaProducer(
+            bootstrap_servers=['kafka:29092'],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
+        # Convert DataFrame to a list of dictionaries for JSON serialization
+        records = df_suspicious.to_dict(orient='records')
+
+        messages_sent = 0
+        for record in records:
+            # Cast datetime objects to strings to prevent JSON serialization errors
+            record['timestamp'] = str(record['timestamp'])
+            record['settlement_date'] = str(record.get('settlement_date', ''))
+
+            # Send the record to the target topic
+            producer.send('fraud_alerts', record)
+            messages_sent += 1
+
+        # Ensure all asynchronous messages are successfully delivered to the broker
+        producer.flush()
+        print(f"INFO: Successfully transmitted {messages_sent} alert(s) to Kafka topic 'fraud_alerts'.")
+
+    except Exception as e:
+        print(f"ERROR: Failed to transmit alerts to Kafka. Broker might be unreachable. Details: {e}")
 
 def generate_batch():
     """Generate a batch of fake transactions, save to data lake (MinIO) and cleanup staging"""
@@ -173,7 +211,7 @@ def detect_suspicious_transactions(df):
 def process_batch(df_raw):
     """
     Process a batch of transactions through the ETL pipeline including
-    currency normalization via API and cloud persistence.
+    currency normalization via API, cloud persistence, and real-time alerts.
     """
     try:
         print(f"Loaded {len(df_raw)} transactions from Data Lake")
@@ -225,6 +263,10 @@ def process_batch(df_raw):
             if local_path.exists():
                 local_path.unlink()
                 print("Local suspicious file cleaned.")
+
+            # Step 5: Kafka Integration - Real-time Streaming
+            print("INFO: Initiating real-time alert transmission to Kafka broker...")
+            send_suspicious_to_kafka(df_suspicious)
 
         print("Batch processing completed successfully")
 
