@@ -9,6 +9,8 @@ import time
 import pandas as pd
 import boto3
 import requests
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from botocore.exceptions import ClientError
@@ -16,17 +18,23 @@ from scripts.generate_transactions import generate_transactions
 
 
 # Configuration
-TRANSACTIONS_FOLDER = Path("./transactions")
-PROCESSED_FOLDER = Path("./processed")
-SUSPICIOUS_FOLDER = Path("./suspicious")
+BASE_TEMP_DIR = Path(tempfile.gettempdir())
+TRANSACTIONS_FOLDER = BASE_TEMP_DIR / "transactions"
+PROCESSED_FOLDER = BASE_TEMP_DIR / "processed"
+SUSPICIOUS_FOLDER = BASE_TEMP_DIR / "suspicious"
+
 INTERVAL_SECONDS = 60  # Generate transactions every 1 minute
 TRANSACTIONS_PER_BATCH = 100  # Number of transactions to generate each time
 
 # MinIO / S3 Configuration
 BUCKET_NAME = "datalake"
+
+# Buscamos la variable de entorno MINIO_URL. Si no existe, usamos localhost por defecto.
+MINIO_ENDPOINT = os.getenv("MINIO_URL", "http://localhost:9000")
+
 s3_client = boto3.client(
     "s3",
-    endpoint_url="http://localhost:9000",
+    endpoint_url=MINIO_ENDPOINT,
     aws_access_key_id="admin",
     aws_secret_access_key="password123",
 )
@@ -222,6 +230,22 @@ def process_batch(df_raw):
 
     except Exception as e:
         print(f"ERROR: Error processing batch: {e}")
+
+
+def run_pipeline_once():
+    """Función de entrada para Apache Airflow (Ejecuta 1 solo batch)"""
+    print("="*60)
+    print("AIRFLOW TASK: RUNNING ETL PIPELINE BATCH")
+    print("="*60)
+
+    setup_folders()
+    setup_minio()
+
+    df_to_process = generate_batch()
+    if df_to_process is not None and not df_to_process.empty:
+        process_batch(df_to_process)
+    else:
+        print("No data generated in this batch.")
 
 
 def main():

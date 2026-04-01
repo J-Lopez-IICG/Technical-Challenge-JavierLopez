@@ -86,3 +86,76 @@ graph LR
     class Main orange;
     class Staging lightblue;
     class MinIO green;
+```
+## Arquitectura de la Fase 2: ETL, Calidad de Datos y Orquestación
+
+En esta etapa se implementó la lógica de transformación y las reglas de negocio, evolucionando el Data Lake hacia una Arquitectura Medallón y automatizando el flujo de trabajo mediante un orquestador de grado de producción.
+
+### Componentes Técnicos
+* **Capa Silver (Limpieza y Tipado):** Implementación de estandarización de formatos, imputación lógica de valores nulos e inferencia de moneda basada en el país de origen. Se estableció un filtro duro para la remoción de outliers técnicos (montos negativos o sistémicamente irreales).
+* **Enriquecimiento de Datos:** Integración en tiempo real con *ExchangeRate API* para normalizar los montos de transacciones a dólares estadounidenses (USD), garantizando una base equitativa para la evaluación de riesgos.
+* **Motor de Reglas de Fraude:** Desarrollo de una capa analítica que segmenta los datos en flujos normales y sospechosos, evaluando métricas como montos inusualmente altos, múltiples intentos fallidos, violaciones de seguridad y riesgo de transacciones internacionales.
+* **Orquestación (Apache Airflow):** Transición de la ejecución manual mediante scripts a un *Directed Acyclic Graph* (DAG) dockerizado. Esto permite la ejecución automatizada, programada y monitoreada del pipeline de forma continua.
+
+## Estado de Avance: Fase 2
+
+| Objetivo | Estado | Descripción Técnica | Tiempo Estimado |
+| :--- | :--- | :--- | :--- |
+| **Limpieza de Datos** | Completado | Manejo de nulos, estandarización de strings y eliminación de outliers. | 45 min |
+| **Integración API** | Completado | Conversión de divisas a USD con mecanismo de fallback estático. | 45 min |
+| **Detección de Fraude** | Completado | Implementación de 4 reglas de negocio para clasificar transacciones. | 1h 00 min |
+| **Arquitectura Silver** | Completado | Partición y persistencia en subcarpetas `silver/processed` y `silver/suspicious`. | 30 min |
+| **Apache Airflow** | Completado | Dockerización y configuración del DAG para automatización continua. | 1h 30 min |
+
+> **Nota sobre el Cronograma:** El tiempo total invertido en la Fase 2 fue de **4.5 horas**. Este tiempo contempla el diseño de la lógica de transformación, el manejo de dependencias de red y la resolución de conflictos de permisos en el entorno de contenedores del orquestador.
+
+## Decisiones de Ingeniería y Arquitectura
+
+* **Arquitectura Medallón:** Se adoptó un diseño estructurado separando los datos crudos (`raw/`) de los datos curados (`silver/`), asegurando que la capa analítica consuma únicamente registros validados y enriquecidos.
+* **Aislamiento de Entornos (Archivos Temporales):** Para garantizar la compatibilidad entre la ejecución en el nodo local y los *workers* de Airflow en Docker, se reemplazó el almacenamiento de tránsito estático por el uso de la librería `tempfile`. Esto asegura la naturaleza efímera de los contenedores y evita la falla crítica por falta de permisos de escritura (`[Errno 13]`).
+* **Resiliencia de Red (Fallbacks):** La consulta a la API de tipos de cambio se configuró con un límite de tiempo estricto (*timeout*). Ante la falta de respuesta externa, el sistema recurre automáticamente a un diccionario estático de tasas predefinidas, garantizando que una anomalía de red no detenga el pipeline.
+* **Variables de Entorno Dinámicas:** La conexión al Data Lake se abstrajo mediante la variable de entorno `MINIO_URL`, permitiendo que el código fuente sea agnóstico a la infraestructura subyacente y se ejecute sin modificaciones tanto en el host local como en la red interna de Docker.
+
+### Flujo de Datos de la Fase 2
+
+```mermaid
+graph TD
+    %% Nodos
+    API[ExchangeRate API]
+
+    subgraph Orchestration_Layer [Apache Airflow]
+        DAG[DAG: fintech_etl_pipeline]
+        Extractor[Generador de Transacciones]
+        Transform[ETL & Motor de Reglas]
+    end
+
+    subgraph Ephemeral_Storage [Temp Storage]
+        Staging[/"/tmp/transactions"/]
+    end
+
+    subgraph Data_Lake [MinIO Data Lake]
+        Raw[/"raw/transactions/"/]
+        SilverProc[/"silver/processed/"/]
+        SilverSusp[/"silver/suspicious/"/]
+    end
+
+    %% Conexiones
+    DAG -->|Trigger 60s| Extractor
+    Extractor -->|Genera CSV temporal| Staging
+    Staging -.->|1. Ingesta cruda| Raw
+    Extractor -->|Pasa DataFrame| Transform
+    API -.->|JSON Rates| Transform
+    Transform -->|2. Guarda normales| SilverProc
+    Transform -->|3. Guarda alertas| SilverSusp
+
+    %% Estilos de Alto Contraste
+    classDef airflow fill:#004080,stroke:#333,stroke-width:2px,color:#fff;
+    classDef external fill:#d98c00,stroke:#333,stroke-width:2px,color:#fff;
+    classDef minio fill:#28a745,stroke:#333,stroke-width:2px,color:#fff;
+    classDef temp fill:#add8e6,stroke:#333,stroke-width:2px,color:#000;
+
+    class Orchestration_Layer,DAG,Extractor,Transform airflow;
+    class Data_Lake,Raw,SilverProc,SilverSusp minio;
+    class Ephemeral_Storage,Staging temp;
+    class API external;
+```

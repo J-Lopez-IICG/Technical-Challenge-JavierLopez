@@ -3,14 +3,35 @@ services:
     image: minio/minio
     container_name: minio_datalake
     ports:
-      - "9000:9000"    # API de S3
-      - "9001:9001"    # Consola Web
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password123
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
+
+  airflow:
+    image: apache/airflow:2.8.1
+    container_name: airflow_orchestrator
+    depends_on:
+      - minio
+    ports:
+      - "8080:8080" # Interfaz Web de Airflow
+    volumes:
+      # Mapeamos tu código local dentro del contenedor de Airflow
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
+      - ./main.py:/opt/airflow/main.py
+      - ./transactions:/opt/airflow/transactions
+      - ./processed:/opt/airflow/processed
+      - ./suspicious:/opt/airflow/suspicious
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - MINIO_URL=http://minio:9000
+      - _PIP_ADDITIONAL_REQUIREMENTS=faker boto3 requests pandas
+    command: standalone # Levanta scheduler, webserver y base de datos juntos
 
 volumes:
   minio_data:
