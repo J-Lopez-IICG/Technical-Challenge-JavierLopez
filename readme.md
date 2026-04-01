@@ -37,6 +37,8 @@ docker-compose up -d
 * Consola de Administración http://localhost:9001
 * Credenciales por defecto: admin/password123
 
+![Bucket MinIO](./img/transactions.png)
+
 ## Estado de Avance: Fase 1
 
 | Objetivo | Estado | Descripción Técnica | Tiempo Estimado |
@@ -87,6 +89,7 @@ graph LR
     class Staging lightblue;
     class MinIO green;
 ```
+
 ## Arquitectura de la Fase 2: ETL, Calidad de Datos y Orquestación
 
 En esta etapa se implementó la lógica de transformación y las reglas de negocio, evolucionando el Data Lake hacia una Arquitectura Medallón y automatizando el flujo de trabajo mediante un orquestador de grado de producción.
@@ -96,6 +99,13 @@ En esta etapa se implementó la lógica de transformación y las reglas de negoc
 * **Enriquecimiento de Datos:** Integración en tiempo real con *ExchangeRate API* para normalizar los montos de transacciones a dólares estadounidenses (USD), garantizando una base equitativa para la evaluación de riesgos.
 * **Motor de Reglas de Fraude:** Desarrollo de una capa analítica que segmenta los datos en flujos normales y sospechosos, evaluando métricas como montos inusualmente altos, múltiples intentos fallidos, violaciones de seguridad y riesgo de transacciones internacionales.
 * **Orquestación (Apache Airflow):** Transición de la ejecución manual mediante scripts a un *Directed Acyclic Graph* (DAG) dockerizado. Esto permite la ejecución automatizada, programada y monitoreada del pipeline de forma continua.
+
+### Iniciar infraestructura Airflow
+docker-compose up -d
+* Consola de Administración http://localhost:8080
+* Credenciales por defecto: admin/admin
+
+![Airflow](./img/airflow.png)
 
 ## Estado de Avance: Fase 2
 
@@ -169,6 +179,12 @@ En esta etapa se transformó el flujo de datos en una solución analítica de al
 * **Carga de Dimensiones (SCD Tipo 0):** Implementación de un proceso de inicialización para dimensiones estáticas y de lenta evolución como Usuarios, Comercios, Métodos de Pago y una Dimensión Temporal detallada.
 * **Integridad Referencial Dinámica:** Uso de SQLAlchemy y scripts de auditoría SQL para establecer llaves primarias (PK) y foráneas (FK), asegurando que ninguna transacción sea procesada sin un contexto válido en el ecosistema.
 
+### Iniciar infraestructura PostgreSQL
+docker-compose up -d
+* Consola de Administración: Herramienta Dbeaver
+* Credenciales por defecto: admin/password123
+
+
 ## Estado de Avance: Fase 3
 
 | Objetivo | Estado | Descripción Técnica | Tiempo Estimado |
@@ -231,6 +247,62 @@ graph TD
     class ETL_Load_Process,DimLoader,FactLoader loader;
     class S3 storage;
 ```
+## Definición de Identificadores (PK)
+
+Se estableció las Llaves Primarias en cada dimensión para asegurar la unicidad de los registros y optimizar las búsquedas.
+```sql
+-- Definir Llaves Primarias (PK) en Dimensiones
+ALTER TABLE dim_time ADD PRIMARY KEY (time_key);
+ALTER TABLE dim_users ADD PRIMARY KEY (user_id);
+ALTER TABLE dim_merchants ADD PRIMARY KEY (merchant_id);
+ALTER TABLE dim_payment_methods ADD PRIMARY KEY (payment_method_id);
+
+-- Definir Llave Primaria en la Tabla de Hechos
+ALTER TABLE fact_transactions ADD PRIMARY KEY (transaction_id);
+```
+### Resolución de Desafío: Mapeo de Métodos de Pago
+Durante la integración, identifiqué que la tabla de hechos original (fact_transactions) no contenía la llave numérica (payment_method_id), sino solo el nombre del método.
+
+Solución: Implementé un proceso de Key Mapping para vincular físicamente ambas tablas:
+
+```sql
+-- Inyectamos la columna de referencia en la tabla de hechos
+ALTER TABLE fact_transactions ADD COLUMN payment_method_id INTEGER;
+
+-- "Soldamos" la relación mediante un Update Join
+-- Vinculamos el texto de la transacción con el ID real de la dimensión
+UPDATE fact_transactions f
+SET payment_method_id = d.payment_method_id
+FROM dim_payment_methods d
+WHERE f.payment_method = d.payment_type;
+
+-- Aplicamos la restricción física de Integridad Referencial
+ALTER TABLE fact_transactions
+ADD CONSTRAINT fk_fact_payments
+FOREIGN KEY (payment_method_id) REFERENCES dim_payment_methods(payment_method_id);
+```
+
+### Construcción de Vínculos (Foreign Keys)
+
+Conecté todos los ejes del modelo para consolidar el esquema estrella, permitiendo realizar cruces complejos entre transacciones, usuarios, comercios y tiempo.
+
+```sql
+-- Conectar Hechos con Tiempo
+ALTER TABLE fact_transactions
+ADD CONSTRAINT fk_fact_time
+FOREIGN KEY (time_key) REFERENCES dim_time(time_key);
+
+-- Conectar Hechos con Usuarios
+ALTER TABLE fact_transactions
+ADD CONSTRAINT fk_fact_users
+FOREIGN KEY (user_id) REFERENCES dim_users(user_id);
+
+-- Conectar Hechos con Comercios
+ALTER TABLE fact_transactions
+ADD CONSTRAINT fk_fact_merchants
+FOREIGN KEY (merchant_id) REFERENCES dim_merchants(merchant_id);
+```
+
 ## Documentación del Modelo de Datos (Star Schema)
 
 El almacén de datos sigue un diseño de **Estrella** para optimizar las consultas analíticas. La tabla de hechos centraliza los eventos métricos, mientras que las dimensiones proveen el contexto.

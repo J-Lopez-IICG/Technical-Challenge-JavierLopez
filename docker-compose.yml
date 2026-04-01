@@ -31,7 +31,11 @@ services:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - MINIO_URL=http://minio:9000
       - _PIP_ADDITIONAL_REQUIREMENTS=faker boto3 requests pandas
-    command: standalone # Levanta scheduler, webserver y base de datos juntos
+    # Usamos un comando compuesto para asegurar que el usuario siempre exista
+    command: >
+      bash -c "airflow db init &&
+      airflow users create --username admin --firstname Javier --lastname Lopez --role Admin --email admin@example.com --password admin || true &&
+      airflow standalone"
   postgres:
     image: postgres:15
     container_name: fintech_postgres
