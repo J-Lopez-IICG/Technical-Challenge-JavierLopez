@@ -105,7 +105,9 @@ docker-compose up -d
 * Consola de Administración http://localhost:8080
 * Credenciales por defecto: admin/admin
 
-![Airflow](./img/airflow.png)
+| Pipeline de Orquestación | Capa Silver: Procesados | Capa Silver: Sospechosos |
+| :---: | :---: | :---: |
+| ![Airflow](./img/airflow.png) | ![processed](./img/processed.png) | ![suspicious](./img/suspicious.png) |
 
 ## Estado de Avance: Fase 2
 
